@@ -39,6 +39,27 @@ export class Comfyui implements INodeType {
 				description: 'The ComfyUI workflow in JSON format',
 			},
 			{
+				displayName: 'Allowed File Types',
+				name: 'allowedFileTypes',
+				type: 'multiOptions',
+				default: ['png', 'jpg'],
+				options: [
+					{
+						name: 'PNG',
+						value: 'png',
+					},
+					{
+						name: 'JPEG',
+						value: 'jpg',
+					},
+					{
+						name: 'MP3',
+						value: 'mp3',
+					},
+				],
+				description: 'The file types to process from workflow outputs',
+			},
+			{
 				displayName: 'Output Format',
 				name: 'outputFormat',
 				type: 'options',
@@ -53,7 +74,12 @@ export class Comfyui implements INodeType {
 					},
 				],
 				default: 'jpeg',
-				description: 'The format of the output images',
+				description: 'The format of the output images (only applies to image files)',
+				displayOptions: {
+					show: {
+						allowedFileTypes: ['png', 'jpg'],
+					},
+				},
 			},
 			{
 				displayName: 'JPEG Quality',
@@ -68,6 +94,7 @@ export class Comfyui implements INodeType {
 				displayOptions: {
 					show: {
 						outputFormat: ['jpeg'],
+						allowedFileTypes: ['png', 'jpg'],
 					},
 				},
 			},
@@ -81,10 +108,29 @@ export class Comfyui implements INodeType {
 		],
 	};
 
+	private getFileExtension(filename: string): string {
+		return filename.toLowerCase().split('.').pop() || '';
+	}
+
+	private getMimeType(extension: string): string {
+		const FILE_TYPE_MAP: Record<string, string> = {
+			'png': 'image/png',
+			'jpg': 'image/jpeg',
+			'jpeg': 'image/jpeg',
+			'mp3': 'audio/mpeg',
+		};
+		return FILE_TYPE_MAP[extension] || 'application/octet-stream';
+	}
+
+	private isImageFile(extension: string): boolean {
+		return ['png', 'jpg', 'jpeg'].includes(extension);
+	}
+
 	async execute(this: IExecuteFunctions): Promise<INodeExecutionData[][]> {
 		const credentials = await this.getCredentials('comfyUIApi');
 		const workflow = this.getNodeParameter('workflow', 0) as string;
 		const timeout = this.getNodeParameter('timeout', 0) as number;
+		const allowedFileTypes = this.getNodeParameter('allowedFileTypes', 0) as string[];
 		const outputFormat = this.getNodeParameter('outputFormat', 0) as string;
 		let jpegQuality: number
 		if (outputFormat === 'jpeg') {
@@ -172,30 +218,51 @@ export class Comfyui implements INodeType {
 						throw new NodeApiError(this.getNode(), { message: '[ComfyUI] No outputs found in workflow result' });
 					}
 
-					// Get all image outputs
+					// Get all outputs (not just images)
 					const outputs = await Promise.all(
 						Object.values(promptResult.outputs)
 							.flatMap((nodeOutput: any) => nodeOutput.images || [])
-							.filter((image: any) => image.type === 'output' || image.type === 'temp')
+							.filter((file: any) => {
+								const extension = this.getFileExtension(file.filename);
+								return (file.type === 'output' || file.type === 'temp') && 
+									   allowedFileTypes.includes(extension);
+							})
 							.map(async (file: any) => {
-								console.log(`[ComfyUI] Downloading ${file.type} image:`, file.filename);
-								let imageUrl = `${apiUrl}/view?filename=${file.filename}&subfolder=${file.subfolder || ''}&type=${file.type || ''}`;
-
+								const extension = this.getFileExtension(file.filename);
+								console.log(`[ComfyUI] Downloading ${file.type} file:`, file.filename);
+								let fileUrl = `${apiUrl}/view?filename=${file.filename}&subfolder=${file.subfolder || ''}&type=${file.type || ''}`;
 
 								try {
-									const imageData = await this.helpers.request({
+									const fileData = await this.helpers.request({
 										method: 'GET',
-										url: imageUrl,
+										url: fileUrl,
 										encoding: null,
 										headers,
 									});
-									const image = await Jimp.read(Buffer.from(imageData, 'base64'));
+
 									let outputBuffer: Buffer;
-									if (outputFormat === 'jpeg') {
-										outputBuffer = await image.getBuffer("image/jpeg", { quality: jpegQuality });
+									let finalExtension: string;
+									let mimeType: string;
+
+									if (this.isImageFile(extension)) {
+										// Process images with Jimp
+										const image = await Jimp.read(Buffer.from(fileData, 'base64'));
+										if (outputFormat === 'jpeg') {
+											outputBuffer = await image.getBuffer("image/jpeg", { quality: jpegQuality });
+											finalExtension = 'jpeg';
+											mimeType = 'image/jpeg';
+										} else {
+											outputBuffer = await image.getBuffer(`image/png`);
+											finalExtension = 'png';
+											mimeType = 'image/png';
+										}
 									} else {
-										outputBuffer = await image.getBuffer(`image/png`);
+										// For non-image files (like MP3), use the raw data
+										outputBuffer = Buffer.from(fileData, 'base64');
+										finalExtension = extension;
+										mimeType = this.getMimeType(extension);
 									}
+
 									const outputBase64 = outputBuffer.toString('base64');
 									const item: INodeExecutionData = {
 										json: {
@@ -203,21 +270,23 @@ export class Comfyui implements INodeType {
 											type: file.type,
 											subfolder: file.subfolder || '',
 											data: outputBase64,
+											fileType: finalExtension,
+											mimeType: mimeType,
 										},
 										binary: {
 											data: {
 												fileName: file.filename,
 												data: outputBase64,
-												fileType: 'image',
+												fileType: finalExtension === 'mp3' ? 'audio' : (this.isImageFile(finalExtension) ? 'image' : 'document'),
 												fileSize: Math.round(outputBuffer.length / 1024 * 10) / 10 + " kB",
-												fileExtension: outputFormat,
-												mimeType: `image/${outputFormat}`,
+												fileExtension: finalExtension,
+												mimeType: mimeType,
 											}
 										}
 									};
 									return item
 								} catch (error) {
-									console.error(`[ComfyUI] Failed to download image ${file.filename}:`, error);
+									console.error(`[ComfyUI] Failed to download file ${file.filename}:`, error);
 									return {
 										json: {
 											filename: file.filename,
@@ -230,7 +299,7 @@ export class Comfyui implements INodeType {
 							})
 					);
 
-					console.log('[ComfyUI] All images downloaded successfully');
+					console.log('[ComfyUI] All files downloaded successfully');
 					return [outputs];
 				}
 			}
